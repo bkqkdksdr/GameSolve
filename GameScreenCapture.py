@@ -19,6 +19,7 @@ except ImportError:
 
 DEFAULT_WINDOW_TITLE = "BRA-AL00"
 
+"""python GameScreenCapture.py --extract-sudoku --only-sudoku"""
 
 def default_output_dir():
     base_dir = os.path.dirname(os.path.abspath(__file__))

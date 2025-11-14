@@ -7,6 +7,8 @@ import os  # 导入os模块用于文件操作
 
 pytesseract.pytesseract.tesseract_cmd = r'D:\Program Files\Tesseract-OCR\tesseract.exe'
 
+"""python SolvePuzzle.py"""
+
 def preprocess_sudoku_image(image_path):
     """预处理数独图片"""
     # 读取图片
@@ -180,6 +182,68 @@ def print_sudoku_grid(grid):
             print("+" + "---+" * 9)
     print("+" + "---+" * 9)
 
+def is_valid_move(grid, row, col, num):
+    """检查在数独网格中指定位置放置数字是否有效"""
+    # 检查行是否有重复
+    for i in range(9):
+        if grid[row][i] == num:
+            return False
+    
+    # 检查列是否有重复
+    for i in range(9):
+        if grid[i][col] == num:
+            return False
+    
+    # 检查3x3宫格是否有重复
+    start_row, start_col = 3 * (row // 3), 3 * (col // 3)
+    for i in range(start_row, start_row + 3):
+        for j in range(start_col, start_col + 3):
+            if grid[i][j] == num:
+                return False
+    
+    return True
+
+def solve_sudoku(grid):
+    """使用回溯法求解数独"""
+    # 查找第一个空单元格（值为0）
+    for row in range(9):
+        for col in range(9):
+            if grid[row][col] == 0:
+                # 尝试放置1-9的数字
+                for num in range(1, 10):
+                    if is_valid_move(grid, row, col, num):
+                        # 放置数字
+                        grid[row][col] = num
+                        
+                        # 递归求解剩余的数独
+                        if solve_sudoku(grid):
+                            return True
+                        
+                        # 如果当前数字导致无解，则回溯
+                        grid[row][col] = 0
+                
+                # 如果1-9都无法放置，则无解
+                return False
+    
+    # 所有单元格都已填满，求解成功
+    return True
+
+def print_solved_sudoku(grid):
+    """美观地打印求解后的数独网格"""
+    print("\n求解后的数独:")
+    print("+" + "---+" * 9)
+    for i in range(9):
+        row_str = "|"
+        for j in range(9):
+            cell = grid[i][j]
+            row_str += f" {cell} |"
+        print(row_str)
+        if (i + 1) % 3 == 0 and i != 8:
+            print("+" + "---+" * 9)
+        else:
+            print("+" + "---+" * 9)
+    print("+" + "---+" * 9)
+
 # 使用示例
 if __name__ == "__main__":
     # 获取当前脚本所在目录
@@ -212,13 +276,29 @@ if __name__ == "__main__":
         sudoku_grid = recognize_sudoku_from_image(image_path)
         
         if sudoku_grid:
-            # 打印结果
+            # 打印识别结果
             print_sudoku_grid(sudoku_grid)
             
             # 同时以数组形式打印
             print("\n数组形式:")
             for row in sudoku_grid:
                 print(row)
+            
+            # 复制数独网格用于求解
+            solved_grid = [row.copy() for row in sudoku_grid]
+            
+            # 求解数独
+            print("\n正在求解数独...")
+            if solve_sudoku(solved_grid):
+                # 打印求解结果
+                print_solved_sudoku(solved_grid)
+                
+                # 以数组形式打印求解结果
+                print("\n求解结果数组形式:")
+                for row in solved_grid:
+                    print(row)
+            else:
+                print("\n无法求解此数独")
         else:
             print("未能成功识别数独")
     except Exception as e:
