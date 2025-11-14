@@ -3,6 +3,7 @@ import numpy as np
 import pytesseract
 from PIL import Image
 import matplotlib.pyplot as plt
+import os  # 导入os模块用于文件操作
 
 pytesseract.pytesseract.tesseract_cmd = r'D:\Program Files\Tesseract-OCR\tesseract.exe'
 
@@ -181,8 +182,30 @@ def print_sudoku_grid(grid):
 
 # 使用示例
 if __name__ == "__main__":
-    # 请将下面的路径替换为您的数独图片路径
-    image_path = "D:\ZYE\PY\GameSolve\screenshots\sudoku_grid_20251114_205900_166072.png"
+    # 获取当前脚本所在目录
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    # 构建screenshots文件夹路径
+    screenshots_dir = os.path.join(current_dir, "screenshots")
+    
+    # 查找screenshots文件夹中所有符合sudoku_grid_*.png格式的文件
+    sudoku_files = []
+    if os.path.exists(screenshots_dir):
+        for file in os.listdir(screenshots_dir):
+            if file.startswith("sudoku_grid_") and file.endswith(".png"):
+                sudoku_files.append(file)
+    
+    # 如果找到符合条件的文件，选择最新的一个
+    if sudoku_files:
+        # 根据文件修改时间排序，最新的在最后
+        sudoku_files.sort(key=lambda x: os.path.getmtime(os.path.join(screenshots_dir, x)))
+        # 获取最新的文件
+        latest_file = sudoku_files[-1]
+        # 构建完整路径
+        image_path = os.path.join(screenshots_dir, latest_file)
+        print(f"使用最新的数独图片: {latest_file}")
+    else:
+        print("未找到符合条件的数独图片(sudoku_grid_*.png)")
+        exit(1)
     
     try:
         # 识别数独
@@ -198,8 +221,7 @@ if __name__ == "__main__":
                 print(row)
         else:
             print("未能成功识别数独")
-            
     except Exception as e:
-        print(f"处理过程中出现错误: {e}")
+        print(f"处理数独图片时出错: {e}")
         print("请确保已安装必要的库: opencv-python, pytesseract, PIL")
         print("并且已安装Tesseract OCR")
