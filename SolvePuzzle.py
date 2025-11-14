@@ -1,178 +1,205 @@
-"""
-SolvePuzzle.py
-- 唯一功能：从截图中自动裁剪棋盘方格区域，并保存为 board_*.png 到 screenshots 文件夹。
-- 依赖：opencv-python、numpy（用于图像处理）。
-- 使用：
-    1) 默认从 screenshots 目录中选择最新的 screen_*.png/jpg 作为输入：
-       python SolvePuzzle.py
-    2) 指定输入图片：
-       python SolvePuzzle.py --input screenshots/screen_2025....png
-    3) 手动指定棋盘矩形（x,y,w,h），当自动检测失败时：
-       python SolvePuzzle.py --input <path> --board 80,240,360,360
-"""
-import os
-import re
-import sys
-import argparse
-from glob import glob
-
 import cv2
 import numpy as np
+import pytesseract
+from PIL import Image
+import matplotlib.pyplot as plt
 
-DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
+pytesseract.pytesseract.tesseract_cmd = r'D:\Program Files\Tesseract-OCR\tesseract.exe'
 
-
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def latest_screenshot(output_dir: str) -> str | None:
-    """返回 screenshots 目录下最新的 screen_*.png/jpg 文件路径。"""
-    patterns = [os.path.join(output_dir, "screen_*.png"), os.path.join(output_dir, "screen_*.jpg"), os.path.join(output_dir, "screen_*.jpeg")]
-    files = []
-    for p in patterns:
-        files.extend(glob(p))
-    if not files:
+def preprocess_sudoku_image(image_path):
+    """预处理数独图片"""
+    # 读取图片
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"无法读取图片: {image_path}")
         return None
-    # 依据文件名中的时间戳排序（若失败则按修改时间）
-    def key_func(f):
-        m = re.search(r"screen_(\d{8}_\d{6}_\d+)", os.path.basename(f))
-        if m:
-            return m.group(1)
-        return str(os.path.getmtime(f))
-    files.sort(key=key_func)
-    return files[-1]
+    
+    # 转换为灰度图
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # 高斯模糊
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # 自适应阈值处理
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   cv2.THRESH_BINARY_INV, 11, 2)
+    
+    return thresh, gray
 
-
-def detect_board_rect(bgr: np.ndarray) -> tuple[int, int, int, int] | None:
-    """自动检测棋盘方格区域，返回 (x,y,w,h)。
-    思路：
-    - HSV 颜色空间中，棋盘背景为低亮度（V低）、低饱和度的深灰色，做阈值得到掩膜；
-    - 形态学闭运算合并方格；
-    - 在掩膜中寻找近似正方形且面积较大的外接矩形，作为棋盘区域。
-    """
-    h, w = bgr.shape[:2]
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # 阈值范围：暗灰（低V），适度限制S以避免彩色星星
-    low = np.array([0, 0, 0])
-    high = np.array([180, 90, 110])  # S<=90, V<=110（可根据截图微调）
-    mask = cv2.inRange(hsv, low, high)
-
-    # 形态学：闭运算 + 开运算，平滑与填充小孔
-    k = max(3, int(min(h, w) * 0.006))  # 自适应核大小
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    # 轮廓寻找
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
+def find_sudoku_grid(image):
+    """查找数独网格"""
+    # 查找轮廓
+    contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # 找到最大的轮廓（应该是数独网格）
+    if not contours:
         return None
+    
+    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # 近似轮廓为多边形
+    epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+    approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+    
+    if len(approx) == 4:
+        return approx
+    return None
 
-    img_area = h * w
-    candidates: list[tuple[int, int, int, int, float]] = []  # (x,y,w,h,score)
-    for c in cnts:
-        x, y, ww, hh = cv2.boundingRect(c)
-        area = ww * hh
-        if area < img_area * 0.05:  # 太小跳过
-            continue
-        ar = ww / float(hh)
-        if ar < 0.85 or ar > 1.15:  # 近似正方形
-            continue
-        # 评分：面积大 + 正方形程度好
-        score = area * (1.0 - abs(ar - 1.0))
-        candidates.append((x, y, ww, hh, score))
+def extract_cells(warped, grid_size=9):
+    """提取数独的每个单元格"""
+    height, width = warped.shape
+    cell_height = height // grid_size
+    cell_width = width // grid_size
+    
+    cells = []
+    positions = []
+    
+    for row in range(grid_size):
+        row_cells = []
+        row_positions = []
+        for col in range(grid_size):
+            # 计算单元格边界（添加一些边距以避免边界线）
+            margin = 5
+            y1 = row * cell_height + margin
+            y2 = (row + 1) * cell_height - margin
+            x1 = col * cell_width + margin
+            x2 = (col + 1) * cell_width - margin
+            
+            # 提取单元格
+            cell = warped[y1:y2, x1:x2]
+            row_cells.append(cell)
+            row_positions.append((row, col))
+        
+        cells.append(row_cells)
+        positions.append(row_positions)
+    
+    return cells, positions
 
-    if not candidates:
+def recognize_digit(cell_image):
+    """识别单个单元格中的数字"""
+    # 调整图像大小以提高OCR准确率
+    cell_resized = cv2.resize(cell_image, (50, 50))
+    
+    # 转换为PIL图像
+    pil_image = Image.fromarray(cell_resized)
+    
+    # 使用pytesseract识别数字
+    config = '--psm 10 --oem 3 -c tessedit_char_whitelist=0123456789'
+    digit = pytesseract.image_to_string(pil_image, config=config)
+    
+    # 清理识别结果
+    digit = digit.strip()
+    
+    # 如果识别为空或不是单个数字，则返回0（表示空单元格）
+    if not digit or len(digit) != 1 or not digit.isdigit():
+        return 0
+    
+    return int(digit)
+
+def recognize_sudoku_from_image(image_path):
+    """从图片中识别数独"""
+    print("正在处理数独图片...")
+    
+    # 预处理图片
+    result = preprocess_sudoku_image(image_path)
+    if result is None:
         return None
-    # 选择评分最高者
-    candidates.sort(key=lambda t: t[4])
-    x, y, ww, hh, _ = candidates[-1]
+    
+    thresh, gray = result
+    
+    # 查找数独网格
+    grid_contour = find_sudoku_grid(thresh)
+    if grid_contour is None:
+        print("未找到数独网格")
+        return None
+    
+    # 透视变换以校正图像
+    points = grid_contour.reshape(4, 2)
+    rect = np.zeros((4, 2), dtype="float32")
+    
+    # 对点进行排序：[左上，右上，右下，左下]
+    s = points.sum(axis=1)
+    rect[0] = points[np.argmin(s)]
+    rect[2] = points[np.argmax(s)]
+    
+    diff = np.diff(points, axis=1)
+    rect[1] = points[np.argmin(diff)]
+    rect[3] = points[np.argmax(diff)]
+    
+    # 计算新图像的尺寸
+    width = max(np.linalg.norm(rect[0] - rect[1]), np.linalg.norm(rect[2] - rect[3]))
+    height = max(np.linalg.norm(rect[0] - rect[3]), np.linalg.norm(rect[1] - rect[2]))
+    
+    dst = np.array([
+        [0, 0],
+        [width - 1, 0],
+        [width - 1, height - 1],
+        [0, height - 1]
+    ], dtype="float32")
+    
+    # 计算透视变换矩阵并应用
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(gray, M, (int(width), int(height)))
+    
+    # 再次二值化校正后的图像
+    warped_thresh = cv2.adaptiveThreshold(warped, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY_INV, 11, 2)
+    
+    # 提取单元格
+    cells, positions = extract_cells(warped_thresh)
+    
+    # 识别每个单元格的数字
+    sudoku_grid = [[0 for _ in range(9)] for _ in range(9)]
+    
+    print("正在识别数字...")
+    for i in range(9):
+        for j in range(9):
+            cell = cells[i][j]
+            digit = recognize_digit(cell)
+            sudoku_grid[i][j] = digit
+    
+    return sudoku_grid
 
-    # 可选：轻微向外扩展，避免切到边缘（按比例扩 2%）
-    pad = int(0.02 * min(ww, hh))
-    x = max(0, x - pad)
-    y = max(0, y - pad)
-    ww = min(w - x, ww + 2 * pad)
-    hh = min(h - y, hh + 2 * pad)
-    return x, y, ww, hh
+def print_sudoku_grid(grid):
+    """美观地打印数独网格"""
+    print("\n识别到的数独:")
+    print("+" + "---+" * 9)
+    for i in range(9):
+        row_str = "|"
+        for j in range(9):
+            cell = grid[i][j]
+            if cell == 0:
+                row_str += "   |"
+            else:
+                row_str += f" {cell} |"
+        print(row_str)
+        if (i + 1) % 3 == 0 and i != 8:
+            print("+" + "---+" * 9)
+        else:
+            print("+" + "---+" * 9)
+    print("+" + "---+" * 9)
 
-
-def crop_board(input_path: str, output_dir: str) -> tuple[str | None, str | None]:
-    """对输入图片裁剪棋盘区域并保存，返回 (保存路径, 错误)。"""
-    if not os.path.isfile(input_path):
-        return None, f"找不到输入图片：{input_path}"
-    bgr = cv2.imread(input_path)
-    if bgr is None:
-        return None, "读取图片失败（可能路径或格式问题）"
-    rect = detect_board_rect(bgr)
-    if rect is None:
-        return None, "自动检测棋盘失败，可使用 --board x,y,w,h 手动指定"
-    x, y, ww, hh = rect
-    crop = bgr[y:y+hh, x:x+ww]
-
-    ensure_dir(output_dir)
-    out_path = os.path.join(output_dir, f"board_{os.path.splitext(os.path.basename(input_path))[0].replace('screen_','')}.png")
-    cv2.imwrite(out_path, crop)
-    return out_path, None
-
-
-def crop_board_manual(input_path: str, output_dir: str, rect_str: str) -> tuple[str | None, str | None]:
-    """手动指定矩形裁剪，rect_str 形如 "x,y,w,h"。"""
-    try:
-        parts = [int(p) for p in rect_str.split(',')]
-        if len(parts) != 4:
-            return None, "--board 需要4个整数：x,y,w,h"
-        x, y, ww, hh = parts
-    except Exception:
-        return None, "--board 参数解析失败，应为 x,y,w,h"
-    if not os.path.isfile(input_path):
-        return None, f"找不到输入图片：{input_path}"
-    bgr = cv2.imread(input_path)
-    if bgr is None:
-        return None, "读取图片失败"
-    h, w = bgr.shape[:2]
-    x = max(0, min(x, w-1))
-    y = max(0, min(y, h-1))
-    ww = max(1, min(ww, w-x))
-    hh = max(1, min(hh, h-y))
-    crop = bgr[y:y+hh, x:x+ww]
-
-    ensure_dir(output_dir)
-    out_path = os.path.join(output_dir, f"board_{os.path.splitext(os.path.basename(input_path))[0].replace('screen_','')}.png")
-    cv2.imwrite(out_path, crop)
-    return out_path, None
-
-
-def main():
-    parser = argparse.ArgumentParser(description="从截图中裁剪棋盘方格区域并保存为 board_*.png")
-    parser.add_argument("--input", "-i", help="输入截图路径（默认取 screenshots 中最新 screen_* 文件）")
-    parser.add_argument("--output", "-o", default=DEFAULT_OUTPUT_DIR, help="输出目录（默认 screenshots）")
-    parser.add_argument("--board", help="手动指定棋盘矩形 x,y,w,h（自动检测失败时使用）")
-    args = parser.parse_args()
-
-    input_path = args.input
-    if not input_path:
-        input_path = latest_screenshot(args.output)
-        if not input_path:
-            print("未找到任何截图（screen_*.png/jpg）。请先运行 GameScreenCapture.py 生成截图。")
-            sys.exit(1)
-
-    if args.board:
-        out, err = crop_board_manual(input_path, args.output, args.board)
-    else:
-        out, err = crop_board(input_path, args.output)
-
-    if not out:
-        print("裁剪失败：")
-        if err:
-            print(f"- {err}")
-        print("依赖安装：pip install opencv-python numpy")
-        sys.exit(1)
-
-    print("棋盘裁剪完成：")
-    print(out)
-
-
+# 使用示例
 if __name__ == "__main__":
-    main()
+    # 请将下面的路径替换为您的数独图片路径
+    image_path = "D:\ZYE\PY\GameSolve\screenshots\sudoku_grid_20251114_205900_166072.png"
+    
+    try:
+        # 识别数独
+        sudoku_grid = recognize_sudoku_from_image(image_path)
+        
+        if sudoku_grid:
+            # 打印结果
+            print_sudoku_grid(sudoku_grid)
+            
+            # 同时以数组形式打印
+            print("\n数组形式:")
+            for row in sudoku_grid:
+                print(row)
+        else:
+            print("未能成功识别数独")
+            
+    except Exception as e:
+        print(f"处理过程中出现错误: {e}")
+        print("请确保已安装必要的库: opencv-python, pytesseract, PIL")
+        print("并且已安装Tesseract OCR")
