@@ -8,6 +8,15 @@ import subprocess
 import shutil
 import ctypes
 
+# 添加必要的库导入
+try:
+    import cv2
+    import numpy as np
+    from PIL import Image
+    CV_AVAILABLE = True
+except ImportError:
+    CV_AVAILABLE = False
+
 DEFAULT_WINDOW_TITLE = "BRA-AL00"
 
 
@@ -24,8 +33,8 @@ def timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
-def build_file_path(output_dir, fmt, monitor_index=None):
-    name = f"screen_{timestamp()}"
+def build_file_path(output_dir, fmt, monitor_index=None, prefix="screen"):
+    name = f"{prefix}_{timestamp()}"
     if monitor_index is not None:
         name += f"_m{monitor_index}"
     ext = "png" if fmt.lower() == "png" else "jpg" if fmt.lower() in ("jpg", "jpeg") else fmt.lower()
@@ -42,6 +51,149 @@ def save_image_pil(image, path, fmt, quality):
         fmt = "PNG"
         params["compress_level"] = 6
     image.save(path, format=fmt, **params)
+
+
+def preprocess_image(img):
+    """
+    预处理图像，用于数独检测
+    :param img: 原始图像
+    :return: 预处理后的图像
+    """
+    # 转换为灰度图
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # 高斯模糊去除噪声
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # 自适应阈值处理
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
+    
+    return thresh
+
+
+def find_sudoku_grid(thresh_img):
+    """
+    检测数独九宫格的轮廓
+    :param thresh_img: 二值化图像
+    :return: 数独九宫格的四个角点坐标
+    """
+    # 查找轮廓
+    contours, _ = cv2.findContours(
+        thresh_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    
+    # 按面积排序，找到最大的轮廓
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    
+    for contour in contours:
+        # 计算轮廓的周长
+        peri = cv2.arcLength(contour, True)
+        # 多边形近似
+        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        
+        # 如果是四边形
+        if len(approx) == 4:
+            # 重新排序四个角点为：左上、右上、右下、左下
+            approx = approx.reshape(4, 2)
+            rect = np.zeros((4, 2), dtype="float32")
+            
+            # 计算坐标和
+            s = approx.sum(axis=1)
+            rect[0] = approx[np.argmin(s)]  # 左上，和最小
+            rect[2] = approx[np.argmax(s)]  # 右下，和最大
+            
+            # 计算坐标差
+            diff = np.diff(approx, axis=1)
+            rect[1] = approx[np.argmin(diff)]  # 右上，差最小
+            rect[3] = approx[np.argmax(diff)]  # 左下，差最大
+            
+            return rect
+    
+    return None
+
+
+def perspective_transform(img, rect):
+    """
+    透视变换，将数独九宫格校正为正方形
+    :param img: 原始图像
+    :param rect: 数独九宫格的四个角点坐标
+    :return: 校正后的正方形图像
+    """
+    # 计算正方形的宽度和高度
+    (tl, tr, br, bl) = rect
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = max(int(widthA), int(widthB))
+    
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = max(int(heightA), int(heightB))
+    
+    # 定义目标点
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+    
+    # 计算透视变换矩阵
+    M = cv2.getPerspectiveTransform(rect, dst)
+    # 应用透视变换
+    warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
+    
+    return warped
+
+
+def extract_sudoku_from_image(image_path, output_dir, fmt, quality):
+    """
+    从图像中提取数独九宫格并保存
+    :param image_path: 原始图像路径
+    :param output_dir: 输出目录
+    :param fmt: 保存格式
+    :param quality: 保存质量
+    :return: 提取的数独九宫格图像路径，失败则返回None
+    """
+    if not CV_AVAILABLE:
+        print("错误：需要安装OpenCV和NumPy库来提取数独九宫格")
+        print("请运行：pip install opencv-python numpy")
+        return None
+    
+    try:
+        # 读取图像
+        img = cv2.imread(image_path)
+        if img is None:
+            print(f"无法读取图像：{image_path}")
+            return None
+        
+        # 预处理图像
+        thresh = preprocess_image(img)
+        
+        # 查找数独九宫格
+        rect = find_sudoku_grid(thresh)
+        if rect is None:
+            print("未找到数独九宫格")
+            return None
+        
+        # 透视变换，校正为正方形
+        warped = perspective_transform(img, rect)
+        
+        # 保存提取的数独九宫格
+        sudoku_path = build_file_path(output_dir, fmt, prefix="sudoku_grid")
+        
+        # 将OpenCV图像转换为PIL图像
+        warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(warped_rgb)
+        
+        save_image_pil(pil_image, sudoku_path, fmt, quality)
+        
+        return sudoku_path
+        
+    except Exception as e:
+        print(f"提取数独九宫格时出错：{e}")
+        return None
 
 
 def capture_with_pillow(all_monitors, fmt, quality, output_dir):
@@ -417,11 +569,12 @@ def main():
     group.add_argument("--all", action="store_true", help="抓取所有显示器（mss会分别保存；Pillow可能合成为一张）")
     group.add_argument("--monitor", type=int, help="仅抓取指定显示器（1为主显示器，2为副屏等）")
     group.add_argument("--window", type=str, help="按窗口标题抓取指定程序窗口（支持包含匹配）")
-    # 保留 --from-device 但默认不使用
     parser.add_argument("--client-only", action="store_true", help="仅截取窗口客户区（不含边框与标题栏）")
     parser.add_argument("--delay", type=float, default=0.0, help="截图前延迟秒数，便于切换窗口")
     parser.add_argument("--format", "-f", default="png", choices=["png", "jpg", "jpeg"], help="保存格式")
     parser.add_argument("--quality", type=int, default=90, help="JPEG质量（1-100，默认90）")
+    parser.add_argument("--extract-sudoku", action="store_true", help="从截图中提取数独九宫格")
+    parser.add_argument("--only-sudoku", action="store_true", help="仅保存提取的数独九宫格，不保存原始截图")
     args = parser.parse_args()
 
     enable_dpi_awareness()
@@ -469,9 +622,34 @@ def main():
                 print("请先安装依赖：pip install pillow 或 pip install mss")
                 sys.exit(1)
 
+    # 处理数独提取
+    sudoku_paths = []
+    if args.extract_sudoku:
+        for p in paths:
+            sudoku_path = extract_sudoku_from_image(p, args.output, args.format, args.quality)
+            if sudoku_path:
+                sudoku_paths.append(sudoku_path)
+            
+        # 如果启用了只保存数独九宫格选项，则删除原始截图
+        if args.only_sudoku:
+            for p in paths:
+                if os.path.exists(p):
+                    os.remove(p)
+            print("\n原始截图已删除，仅保留数独九宫格")
+            print("最终的数独九宫格截图：")
+            for sp in sudoku_paths:
+                print(sp)
+            sys.exit(0)
+
+    # 输出结果
     print("截图完成，已保存：")
     for p in paths:
         print(p)
+    
+    if sudoku_paths:
+        print("\n数独九宫格已提取并保存：")
+        for sp in sudoku_paths:
+            print(sp)
 
 
 if __name__ == "__main__":
